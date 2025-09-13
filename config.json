@@ -1,0 +1,13 @@
+{
+  "db_path": "magazin.sqlite",
+  "backup_dir": "backups",
+  "expiry_alert_days": [
+    7,
+    14,
+    30
+  ],
+  "low_stock_threshold": 5,
+  "locale": "ro_RO",
+  "db_mode": "local",
+  "api_base_url": "http://localhost:8080"
+}
