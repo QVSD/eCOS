@@ -2,6 +2,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from ..util.config import load_config
 from ..infra.db_init import init_db
 from ..services.use_cases import InventoryService
+from .intrare_dialog import IntrareDialog
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -53,7 +54,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def open_intrare(self):
-        QtWidgets.QMessageBox.information(self, "Intrare", "Aici va fi ecranul de Intrare cu sesiuni și rezumat.")
+        dlg = IntrareDialog(self.svc, self)
+        dlg.exec()
 
     def open_vanzare(self):
         QtWidgets.QMessageBox.information(self, "Vânzare", "Aici va fi ecranul de Vânzare (bon intern), cu total pe ecran.")
