@@ -2,6 +2,8 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from ..services.use_cases import InventoryService
 
 #TO DO cantitatea introdusa nu poate fi cu ,5 trebuie sa fie numar natural!
+# Posibilitatea de a modifica datele introduse dupa adaugare in fereastra. In caz ca am pus ceva gresit.
+# O optiune de a exporta totul ca si tabel (tot ce adaugasem in sesiunea respectiva)
 
 class IntrareDialog(QtWidgets.QDialog):
     def __init__(self, svc: InventoryService, parent=None):
@@ -265,4 +267,16 @@ class IntrareDialog(QtWidgets.QDialog):
             return ean13
 
         raise ValueError("Lungime cod invalidă (accept: 8, 12 sau 13 cifre).")
+    def _on_unit_changed(self, unit: str):
+        if unit == "buc":
+            self.in_qty.setDecimals(0)
+            self.in_qty.setSingleStep(1)
+        else:
+            self.in_qty.setDecimals(3)
+            self.in_qty.setSingleStep(0.1)
+
+        self.in_unit.currentTextChanged.connect(self._on_unit_changed)
+        self._on_unit_changed(self.in_unit.currentText())
+    
+
 

@@ -3,6 +3,7 @@ from ..util.config import load_config
 from ..infra.db_init import init_db
 from ..services.use_cases import InventoryService
 from .intrare_dialog import IntrareDialog
+from .vanzare_dialog import VanzareDialog
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -58,7 +59,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def open_vanzare(self):
-        QtWidgets.QMessageBox.information(self, "Vânzare", "Aici va fi ecranul de Vânzare (bon intern), cu total pe ecran.")
+        dlg = VanzareDialog(self.svc, self)
+        dlg.exec()
 
     def open_stoc(self):
         def human_qty(unit: str, qty_base: int) -> str:

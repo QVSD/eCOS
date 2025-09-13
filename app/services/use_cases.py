@@ -226,3 +226,213 @@ class InventoryService:
         sql += " ORDER BY p.name ASC"
         cur = conn.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
+    
+    def open_receipt(self) -> int:
+        conn = connect(self.db_path)
+        with conn:
+            cur = conn.execute("INSERT INTO receipts(status) VALUES('open')")
+            return cur.lastrowid
+    
+    def add_line_to_receipt(self, receipt_id: int, barcode: str, qty_human: float) -> int:
+        if qty_human <= 0:
+            raise ValueError("Cantitatea trebuie să fie > 0.")
+
+        conn = connect(self.db_path)
+        with conn:
+            st = conn.execute("SELECT status FROM receipts WHERE id=?", (receipt_id,)).fetchone()
+            if not st or st["status"] != "open":
+                raise ValueError("Bonul nu este în stare 'open'.")
+
+            p = conn.execute(
+                "SELECT id, unit, price_per_unit_cents, vat_rate, name FROM products WHERE barcode=?",
+                (barcode,)
+            ).fetchone()
+            if not p:
+                raise ValueError("Produs inexistent. Adaugă-l mai întâi (Intrare).")
+
+            qty_base = to_base_qty(p["unit"], qty_human)
+
+            # preț per unitate de bază
+            if p["unit"] == "buc":
+                unit_price_cents = int(p["price_per_unit_cents"])
+            else:
+                # preț/kg sau /l → transformăm la preț/gram ori /ml
+                unit_price_cents = int(round(p["price_per_unit_cents"] / 1000.0))
+
+            vat_rate = int(p["vat_rate"])
+
+            # Cumulăm dacă există linie cu același produs + același preț/vat (altfel inserăm nouă linie)
+            row = conn.execute("""
+                SELECT id, qty_base
+                FROM receipt_lines
+                WHERE receipt_id=? AND product_id=? AND unit_price_cents=? AND vat_rate=?
+                ORDER BY id LIMIT 1
+            """, (receipt_id, p["id"], unit_price_cents, vat_rate)).fetchone()
+
+            if row:
+                new_qty = int(row["qty_base"]) + qty_base
+                new_total = new_qty * unit_price_cents
+                conn.execute("""
+                    UPDATE receipt_lines
+                    SET qty_base=?, line_total_cents=?
+                    WHERE id=?
+                """, (new_qty, new_total, row["id"]))
+                line_id = row["id"]
+            else:
+                line_total = qty_base * unit_price_cents
+                cur = conn.execute("""
+                    INSERT INTO receipt_lines
+                        (receipt_id, product_id, qty_base, unit_price_cents, vat_rate, line_total_cents)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (receipt_id, p["id"], qty_base, unit_price_cents, vat_rate, line_total))
+                line_id = cur.lastrowid
+
+        return line_id
+    
+    def get_receipt(self, receipt_id: int) -> Dict[str, Any]:
+
+        conn = connect(self.db_path)
+
+        head = conn.execute("SELECT * FROM receipts WHERE id=?", (receipt_id,)).fetchone()
+
+        lines = conn.execute("""
+            SELECT rl.id, rl.product_id, p.name, p.barcode, p.unit,
+                rl.qty_base, rl.unit_price_cents, rl.vat_rate, rl.line_total_cents
+            FROM receipt_lines rl
+            JOIN products p ON p.id = rl.product_id
+            WHERE rl.receipt_id=?
+            ORDER BY rl.id
+        """, (receipt_id,)).fetchall()
+
+        total_cents = conn.execute("""
+            SELECT COALESCE(SUM(line_total_cents),0) AS t
+            FROM receipt_lines
+            WHERE receipt_id=?
+        """, (receipt_id,)).fetchone()["t"]
+
+        return {
+            "head": dict(head) if head else None,
+            "items": [dict(r) for r in lines],
+            "total_cents": int(total_cents),
+        }
+
+    def remove_line(self, line_id: int):
+        conn = connect(self.db_path)
+        with conn:
+            conn.execute("DELETE FROM receipt_lines WHERE id=?", (line_id,))
+
+    # ---------- FIFO pe lot la finalizare ----------
+    def _available_batches(self, conn, product_id: int) -> List[Dict]:
+        # loturi cu stoc > 0, ordonate: cele cu expirare (cea mai apropiată) → apoi fără expirare
+        rows = conn.execute("""
+            SELECT b.id AS batch_id, b.expiry_date,
+                   COALESCE(SUM(m.quantity_base),0) AS stock_base
+            FROM batches b
+            LEFT JOIN movements m ON m.batch_id = b.id
+            WHERE b.product_id=?
+            GROUP BY b.id
+            HAVING stock_base > 0
+            ORDER BY (b.expiry_date IS NULL), b.expiry_date ASC, b.id ASC
+        """, (product_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def _consume_fifo(self, conn, product_id: int, need_base: int, note: str):
+        remaining = need_base
+        for r in self._available_batches(conn, product_id):
+            take = min(remaining, int(r["stock_base"]))
+            if take > 0:
+                conn.execute("""
+                    INSERT INTO movements(product_id, batch_id, quantity_base, reason, note)
+                    VALUES(?, ?, ?, 'sale', ?)
+                """, (product_id, r["batch_id"], -take, note))
+                remaining -= take
+            if remaining == 0:
+                break
+        if remaining > 0:
+            # dacă vrei să permiți consum și din "fără loturi", scoate comentariul de mai jos
+            # conn.execute("INSERT INTO movements(product_id, batch_id, quantity_base, reason, note) VALUES(?, NULL, ?, 'sale', ?)", (product_id, -remaining, note))
+            # remaining = 0
+            raise ValueError("Stoc insuficient pentru produs.")
+        
+    def finalize_receipt(self, receipt_id: int):
+        conn = connect(self.db_path)
+        with conn:
+            head = conn.execute("SELECT status FROM receipts WHERE id=?", (receipt_id,)).fetchone()
+            if not head:
+                raise ValueError("Bon inexistent.")
+            if head["status"] != "open":
+                raise ValueError("Bonul nu este în stare 'open'.")
+
+            # luăm liniile bonului
+            items = conn.execute("""
+                SELECT product_id, qty_base
+                FROM receipt_lines
+                WHERE receipt_id=?
+                ORDER BY id
+            """, (receipt_id,)).fetchall()
+
+            # pentru fiecare produs, consumăm FIFO pe lot
+            for it in items:
+                product_id = int(it["product_id"])
+                remaining  = int(it["qty_base"])
+
+                # 1) loturi cu stoc > 0, ordonate: expirare apropiată → NULL la final
+                rows = conn.execute("""
+                    SELECT b.id AS batch_id,
+                        COALESCE(SUM(m.quantity_base),0) AS stock_base,
+                        b.expiry_date
+                    FROM batches b
+                    LEFT JOIN movements m ON m.batch_id = b.id
+                    WHERE b.product_id=?
+                    GROUP BY b.id
+                    HAVING stock_base > 0
+                    ORDER BY (b.expiry_date IS NULL), b.expiry_date ASC, b.id ASC
+                """, (product_id,)).fetchall()
+
+                for r in rows:
+                    if remaining <= 0:
+                        break
+                    take = min(remaining, int(r["stock_base"]))
+                    if take > 0:
+                        conn.execute("""
+                            INSERT INTO movements(product_id, batch_id, quantity_base, reason, note)
+                            VALUES (?, ?, ?, 'sale', ?)
+                        """, (product_id, r["batch_id"], -take, f"receipt:{receipt_id}"))
+                        remaining -= take
+
+                # 2) fallback: stoc fără lot (batch_id IS NULL)
+                if remaining > 0:
+                    s_null = conn.execute("""
+                        SELECT COALESCE(SUM(quantity_base),0) AS stock_base
+                        FROM movements
+                        WHERE product_id=? AND batch_id IS NULL
+                    """, (product_id,)).fetchone()["stock_base"]
+                    s_null = int(s_null)
+                    if s_null >= remaining:
+                        conn.execute("""
+                            INSERT INTO movements(product_id, batch_id, quantity_base, reason, note)
+                            VALUES (?, NULL, ?, 'sale', ?)
+                        """, (product_id, -remaining, f"receipt:{receipt_id}"))
+                        remaining = 0
+
+                if remaining > 0:
+                    raise ValueError("Stoc insuficient pentru unul dintre produse.")
+
+            # total din SUM(line_total_cents)
+            total_cents = conn.execute("""
+                SELECT COALESCE(SUM(line_total_cents),0) AS t
+                FROM receipt_lines
+                WHERE receipt_id=?
+            """, (receipt_id,)).fetchone()["t"]
+
+            conn.execute("""
+                UPDATE receipts
+                SET status='closed', closed_at=CURRENT_TIMESTAMP, total_cached_cents=?
+                WHERE id=?
+            """, (int(total_cents), receipt_id))
+
+    def void_receipt(self, receipt_id: int):
+        conn = connect(self.db_path)
+        with conn:
+            conn.execute("UPDATE receipts SET status='void' WHERE id=? AND status='open'", (receipt_id,))
+            conn.execute("DELETE FROM receipt_lines WHERE receipt_id=?", (receipt_id,))

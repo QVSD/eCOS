@@ -1,20 +1,39 @@
-# app/util/barcode.py
-def ean13_checksum(d12: str) -> str:
-    if len(d12) != 12 or not d12.isdigit():
-        raise ValueError("EAN-13 body must be 12 digits")
-    s_odd  = sum(int(d12[i]) for i in range(0, 12, 2))
-    s_even = sum(int(d12[i]) for i in range(1, 12, 2))
-    c = (10 - ((s_odd + 3*s_even) % 10)) % 10
-    return str(c)
+def ean13_check_digit(body12: str) -> int:
+    s_odd  = sum(int(d) for i, d in enumerate(body12, 1) if i % 2 == 1)
+    s_even = sum(int(d) for i, d in enumerate(body12, 1) if i % 2 == 0)
+    return (10 - ((s_odd + 3 * s_even) % 10)) % 10
 
-def is_valid_ean13(code: str) -> bool:
-    return len(code) == 13 and code.isdigit() and ean13_checksum(code[:12]) == code[-1]
+def ean8_check_digit(body7: str) -> int:
+    s_odd  = int(body7[0]) + int(body7[2]) + int(body7[4]) + int(body7[6])
+    s_even = int(body7[1]) + int(body7[3]) + int(body7[5])
+    return (10 - ((3 * s_odd + s_even) % 10)) % 10
 
-def next_internal_ean(get_next_number: callable, prefix: str = "299") -> str:
-    """
-    prefix '299' pentru uz intern (nu oficial GS1, dar scannabil).
-    get_next_number(): funcție care întoarce un int incremental (vezi sequences).
-    """
-    n = get_next_number()              # ex: 123456
-    body = f"{prefix}{n:09d}"          # 3 + 9 = 12 cifre
-    return body + ean13_checksum(body)
+def upca_check_digit(body11: str) -> int:
+    s_odd  = sum(int(d) for i, d in enumerate(body11, 1) if i % 2 == 1)
+    s_even = sum(int(d) for i, d in enumerate(body11, 1) if i % 2 == 0)
+    return (10 - ((3 * s_odd + s_even) % 10)) % 10
+
+def normalize_barcode(raw: str) -> str:
+    code = raw.strip()
+    if not code.isdigit():
+        raise ValueError("Codul de bare trebuie să conțină doar cifre.")
+    if len(set(code)) == 1:
+        raise ValueError("Cod invalid (toate cifrele identice).")
+
+    if len(code) == 13:
+        if ean13_check_digit(code[:12]) != int(code[12]):
+            raise ValueError("EAN-13 invalid (cifra de control).")
+        return code
+    if len(code) == 8:
+        if ean8_check_digit(code[:7]) != int(code[7]):
+            raise ValueError("EAN-8 invalid (cifra de control).")
+        return code
+    if len(code) == 12:  # UPC-A -> EAN-13 cu prefix 0
+        if upca_check_digit(code[:11]) != int(code[11]):
+            raise ValueError("UPC-A invalid (cifra de control).")
+        ean13 = "0" + code
+        if ean13_check_digit(ean13[:12]) != int(ean13[12]):
+            raise ValueError("Conversie UPC-A→EAN-13 eșuată.")
+        return ean13
+
+    raise ValueError("Lungime cod invalidă (accept: 8, 12 sau 13 cifre).")
