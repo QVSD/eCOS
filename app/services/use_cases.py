@@ -436,3 +436,100 @@ class InventoryService:
         with conn:
             conn.execute("UPDATE receipts SET status='void' WHERE id=? AND status='open'", (receipt_id,))
             conn.execute("DELETE FROM receipt_lines WHERE receipt_id=?", (receipt_id,))
+
+        # ---- conversii bază -> uman (pt. afișare) ----
+    def from_base_qty(self, unit: str, qty_base: int) -> float:
+        if unit == "buc":
+            return float(qty_base)
+        if unit in ("kg", "l"):
+            return qty_base / 1000.0
+        raise ValueError("Unitate necunoscută")
+
+    # ---- listare stoc pe produs (cu filtrare) ----
+    def get_stock_products(self, search: str = "", low_only: bool = False, low_threshold_human: float = 0.0) -> list[dict]:
+        conn = connect(self.db_path)
+        rows = conn.execute("""
+        SELECT p.id AS product_id, p.name, p.barcode, p.unit,
+                COALESCE(SUM(m.quantity_base),0) AS stock_base
+        FROM products p
+        LEFT JOIN movements m ON m.product_id = p.id
+        GROUP BY p.id
+        """).fetchall()
+
+        items = []
+        for r in rows:
+            unit = r["unit"]
+            stock_base = int(r["stock_base"] or 0)
+            stock_human = float(stock_base) if unit == "buc" else stock_base / 1000.0
+            items.append({
+                "product_id": r["product_id"],
+                "name": r["name"],
+                "barcode": r["barcode"],
+                "unit": unit,
+                "stock_base": stock_base,
+                "stock_human": stock_human,
+            })
+
+        # căutare
+        if search:
+            s = search.lower()
+            items = [it for it in items if s in (it["name"] or "").lower() or s in (it["barcode"] or "").lower()]
+
+        # stoc scăzut per unitatea produsului
+        if low_only:
+            def thr_base_for(unit: str) -> int:
+                return int(round(low_threshold_human)) if unit == "buc" else int(round(low_threshold_human * 1000))
+            items = [it for it in items if it["stock_base"] <= thr_base_for(it["unit"])]
+
+        items.sort(key=lambda x: x["name"] or "")
+        return items
+
+
+    def get_product_batches(self, product_id: int) -> list[dict]:
+        conn = connect(self.db_path)
+        rows = conn.execute("""
+        SELECT b.id AS batch_id, b.expiry_date,
+                COALESCE(SUM(m.quantity_base),0) AS stock_base,
+                p.unit
+        FROM batches b
+        JOIN products p ON p.id = b.product_id
+        LEFT JOIN movements m ON m.batch_id = b.id
+        WHERE b.product_id=?
+        GROUP BY b.id
+        HAVING stock_base <> 0
+        ORDER BY (b.expiry_date IS NULL), b.expiry_date ASC, b.id ASC
+        """, (product_id,)).fetchall()
+
+        items = []
+        unit = None
+        for r in rows:
+            unit = r["unit"]
+            stock_base = int(r["stock_base"] or 0)
+            items.append({
+                "batch_id": r["batch_id"],
+                "expiry_date": r["expiry_date"],
+                "stock_base": stock_base,
+                "stock_human": self.from_base_qty(r["unit"], stock_base),
+                "label": r["expiry_date"] or "(fără expirare)",
+            })
+
+        # pseudo-lot pentru batch_id IS NULL
+        null_row = conn.execute("""
+            SELECT COALESCE(SUM(quantity_base),0) AS stock_base
+            FROM movements
+            WHERE product_id=? AND batch_id IS NULL
+        """, (product_id,)).fetchone()
+        null_stock = int(null_row["stock_base"] or 0)
+        if null_stock != 0:
+            if unit is None:
+                unit = conn.execute("SELECT unit FROM products WHERE id=?", (product_id,)).fetchone()["unit"]
+            items.append({
+                "batch_id": None,
+                "expiry_date": None,
+                "stock_base": null_stock,
+                "stock_human": self.from_base_qty(unit, null_stock),
+                "label": "(fără lot)",
+            })
+
+        return items
+

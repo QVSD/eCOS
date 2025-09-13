@@ -4,6 +4,7 @@ from ..infra.db_init import init_db
 from ..services.use_cases import InventoryService
 from .intrare_dialog import IntrareDialog
 from .vanzare_dialog import VanzareDialog
+from .stoc_window import StocWindow
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -63,22 +64,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def open_stoc(self):
-        def human_qty(unit: str, qty_base: int) -> str:
-            if unit == 'buc':
-                return f"{int(qty_base)} buc"
-            elif unit == 'kg':
-                return f"{qty_base / 1000:.3f} kg"  # grame -> kg
-            elif unit == 'l':
-                return f"{qty_base / 1000:.3f} l"   # ml -> l
-            return str(qty_base)
-
-        items = self.svc.get_stock_list()
-        msg = "\n".join([
-            f"{i['product_name']} | {i['barcode'] or '-'} | stoc: {human_qty(i['unit'], i['stock_qty_base'])}"
-            for i in items[:10]
-        ]) or "Fără produse încă."
-        QtWidgets.QMessageBox.information(self, "Stoc curent (primele 10)", msg)
-
+        dlg = StocWindow(self.svc, self)
+        dlg.exec()
 
     def open_setari(self):
         QtWidgets.QMessageBox.information(self, "Setări & Backup", "Aici vei seta backup zilnic, praguri alerte etc.")
