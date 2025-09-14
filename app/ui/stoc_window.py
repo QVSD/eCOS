@@ -1,6 +1,8 @@
 from PySide6 import QtWidgets, QtCore, QtGui
 from ..services.use_cases import InventoryService
 
+#TO DO, caseta lot are elemente editabile
+
 class LoturiDialog(QtWidgets.QDialog):
     def __init__(self, svc: InventoryService, product_id: int, product_name: str, parent=None):
         super().__init__(parent)
@@ -9,8 +11,8 @@ class LoturiDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Loturi – {product_name}")
         self.resize(560, 420)
 
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Expirare", "Stoc", "Observație"])
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Lot", "Expirare", "Stoc", "Observație"])
         self.table.horizontalHeader().setStretchLastSection(True)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -18,31 +20,43 @@ class LoturiDialog(QtWidgets.QDialog):
         self.refresh()
 
     def refresh(self):
+        def _datestr(v):
+            if not v:
+                return ""
+            # suportă TEXT, datetime.date/datetime
+            return getattr(v, "isoformat", lambda: str(v))()
+
         items = self.svc.get_product_batches(self.product_id)
         self.table.setRowCount(0)
         for it in items:
             r = self.table.rowCount()
             self.table.insertRow(r)
 
-            # Expirare / (fără lot)
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(it["label"]))
+            # LOT
+            lot_text = it.get("lot_code") or "(fără lot)"
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(lot_text))
 
-            # Stoc (frumos formatat)
+            # Expirare (mereu string)
+            exp_text = _datestr(it.get("expiry_date"))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(exp_text))
+
+            # Stoc
             st = it["stock_human"]
             st_text = f"{int(st)}" if float(st).is_integer() else f"{st:.3f}"
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(st_text))
+            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(st_text))
 
-            # Observație expirare apropiată
+            # Observație (expirare apropiată)
             obs = ""
-            if it["expiry_date"]:
-                qd = QtCore.QDate.fromString(it["expiry_date"], "yyyy-MM-dd")
+            if exp_text:
+                qd = QtCore.QDate.fromString(exp_text, "yyyy-MM-dd")
                 if qd.isValid():
                     days = QtCore.QDate.currentDate().daysTo(qd)
                     if days <= 7:
                         obs = f"⚠ în {days} zile" if days >= 0 else f"expirat acum {-days} zile"
-            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(obs))
+            self.table.setItem(r, 3, QtWidgets.QTableWidgetItem(obs))
 
         self.table.resizeColumnsToContents()
+
 
 
 class StocWindow(QtWidgets.QDialog):

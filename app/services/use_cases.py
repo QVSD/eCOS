@@ -1,5 +1,6 @@
 from typing import Optional, List, Dict, Any
 from ..infra.db import connect
+from datetime import date, datetime 
 
 def lei_to_cents(lei: float | str | None) -> Optional[int]:
     if lei is None:
@@ -488,7 +489,7 @@ class InventoryService:
     def get_product_batches(self, product_id: int) -> list[dict]:
         conn = connect(self.db_path)
         rows = conn.execute("""
-        SELECT b.id AS batch_id, b.expiry_date,
+        SELECT b.id AS batch_id,  b.lot_code, b.expiry_date,
                 COALESCE(SUM(m.quantity_base),0) AS stock_base,
                 p.unit
         FROM batches b
@@ -508,28 +509,79 @@ class InventoryService:
             items.append({
                 "batch_id": r["batch_id"],
                 "expiry_date": r["expiry_date"],
+                "lot_code": r["lot_code"],  
                 "stock_base": stock_base,
                 "stock_human": self.from_base_qty(r["unit"], stock_base),
-                "label": r["expiry_date"] or "(fără expirare)",
             })
 
         # pseudo-lot pentru batch_id IS NULL
-        null_row = conn.execute("""
-            SELECT COALESCE(SUM(quantity_base),0) AS stock_base
-            FROM movements
-            WHERE product_id=? AND batch_id IS NULL
-        """, (product_id,)).fetchone()
-        null_stock = int(null_row["stock_base"] or 0)
+        null_stock = int(conn.execute("""
+                SELECT COALESCE(SUM(quantity_base),0) AS stock_base
+                FROM movements
+                WHERE product_id=? AND batch_id IS NULL
+            """, (product_id,)).fetchone()["stock_base"] or 0)
+
         if null_stock != 0:
             if unit is None:
                 unit = conn.execute("SELECT unit FROM products WHERE id=?", (product_id,)).fetchone()["unit"]
             items.append({
                 "batch_id": None,
+                "lot_code": None,
                 "expiry_date": None,
                 "stock_base": null_stock,
                 "stock_human": self.from_base_qty(unit, null_stock),
-                "label": "(fără lot)",
             })
 
         return items
 
+    def get_expiring_batches(self, days: int) -> list[dict]:
+        """
+        Loturi care expiră în următoarele `days` zile (inclusiv azi), doar cu stoc > 0.
+        Returnează: product_name, barcode, expiry_date (YYYY-MM-DD), stock_human, days_left
+        """
+        conn = connect(self.db_path)
+        rows = conn.execute("""
+            SELECT p.name AS product_name, p.barcode, p.unit, b.expiry_date,
+                COALESCE(SUM(m.quantity_base),0) AS stock_base
+            FROM batches b
+            JOIN products p ON p.id = b.product_id
+            LEFT JOIN movements m ON m.batch_id = b.id
+            WHERE b.expiry_date IS NOT NULL
+            GROUP BY b.id
+            HAVING stock_base > 0
+            ORDER BY b.expiry_date ASC, b.id ASC
+        """).fetchall()
+
+        today = date.today()
+        items = []
+
+        for r in rows:
+            raw = r["expiry_date"]
+
+            # normalizează la datetime.date
+            if isinstance(raw, datetime):
+                d = raw.date()
+            elif isinstance(raw, date):
+                d = raw
+            elif isinstance(raw, str) and raw:
+                try:
+                    d = date.fromisoformat(raw)
+                except ValueError:
+                    continue
+            else:
+                continue
+
+            days_left = (d - today).days
+            if 0 <= days_left <= int(days):
+                stock_base = int(r["stock_base"] or 0)
+                stock_human = self.from_base_qty(r["unit"], stock_base)
+                items.append({
+                    "product_name": r["product_name"],
+                    "barcode": r["barcode"],
+                    "expiry_date": d.isoformat(),   # UI primește mereu text
+                    "stock_human": stock_human,
+                    "days_left": days_left,
+                })
+
+        items.sort(key=lambda x: (x["days_left"], x["expiry_date"]))
+        return items
