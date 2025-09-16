@@ -133,6 +133,18 @@ class IntrareDialog(QtWidgets.QDialog):
 
 
     # ----- helpers -----
+
+    def _format_unit_totals(self, summary: dict) -> str:
+        parts = []
+        if summary.get("total_qty_buc", 0):
+            parts.append(f"{summary['total_qty_buc']} buc")
+        if summary.get("total_qty_kg", 0):
+            parts.append(f"{summary['total_qty_kg']:.3f} kg")
+        if summary.get("total_qty_l", 0):
+            parts.append(f"{summary['total_qty_l']:.3f} l")
+        return " | ".join(parts) if parts else "0"
+
+
     def _expiry_str(self) -> str | None:
         return self.in_expiry.date().toString("yyyy-MM-dd") if self.chk_has_expiry.isChecked() else None
 
@@ -244,24 +256,26 @@ class IntrareDialog(QtWidgets.QDialog):
 
     def refresh_summary(self):
         summary = self.svc.get_stock_in_summary(self.session_id)
+        qty_text = self._format_unit_totals(summary)
         self.lbl_summary.setText(
-            f"Distincte: {summary['total_distinct']}  |  Cantitate totală: {summary['total_qty']:.3f}  |  Valoare (cost): {summary['total_value_lei']:.2f} lei"
+            f"Distincte: {summary['total_distinct']}  |  Cantități: {qty_text}  |  Valoare (cost): {summary['total_value_lei']:.2f} lei"
         )
 
 
     def finish_session(self):
-        # scrie mișcările în stoc și închide sesiunea
         self.svc.close_stock_in_session(self.session_id)
         summary = self.svc.get_stock_in_summary(self.session_id)
+        qty_text = self._format_unit_totals(summary)
         QtWidgets.QMessageBox.information(
             self,
             "Rezumat intrare",
             "Sesiune închisă.\n\n"
             f"Produse distincte: {summary['total_distinct']}\n"
-            f"Cantitate totală: {summary['total_qty']:.3f}\n"
+            f"Cantități: {qty_text}\n"
             f"Valoare (cost): {summary['total_value_lei']:.2f} lei\n"
         )
         self.accept()
+
 
     def reject(self):
         # Anulează sesiunea: șterge linii + sesiunea; NU afectează stocul

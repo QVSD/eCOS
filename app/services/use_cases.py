@@ -169,71 +169,73 @@ class InventoryService:
 
     # ---------- REZUMAT SESIUNE ----------
     def get_stock_in_summary(self, session_id: int) -> Dict[str, Any]:
-        """
-        Returnează totaluri pe produs pentru sesiune (în unitatea umană) + valoare totală (în lei) din unit_cost_cents.
-        """
         conn = connect(self.db_path)
         rows = conn.execute("""
             SELECT p.id AS product_id, p.name, p.barcode, p.unit,
-                   l.quantity_base, l.unit_cost_cents
+                l.quantity_base, l.unit_cost_cents
             FROM stock_in_lines l
             JOIN products p ON p.id = l.product_id
             WHERE l.session_id=?
         """, (session_id,)).fetchall()
 
-        # agregare în Python pentru controlul conversiilor
         agg: Dict[int, Dict[str, Any]] = {}
+        # --- NOI: totaluri pe fiecare unitate
+        total_buc = 0            # int
+        total_kg  = 0.0          # float (kg)
+        total_l   = 0.0          # float (l)
+
         for r in rows:
-            pid = r["product_id"]
+            pid  = r["product_id"]
             unit = r["unit"]
             qty_base = int(r["quantity_base"])
-            if unit == 'buc':
+
+            if unit == "buc":
                 qty_human = qty_base
-            else:
+                total_buc += qty_base
+            elif unit == "kg":
                 qty_human = qty_base / 1000.0
+                total_kg  += qty_human
+            elif unit == "l":
+                qty_human = qty_base / 1000.0
+                total_l   += qty_human
+            else:
+                raise ValueError(f"Unitate necunoscută: {unit}")
 
             value_cents = 0
             if r["unit_cost_cents"] is not None:
-                if unit == 'buc':
+                if unit == "buc":
                     value_cents = r["unit_cost_cents"] * qty_base
                 else:
-                    # (cents per kg/l) * (ml/g) / 1000
                     value_cents = int(round(r["unit_cost_cents"] * (qty_base / 1000.0)))
 
             if pid not in agg:
-                agg[pid] = {
-                    "name": r["name"],
-                    "barcode": r["barcode"],
-                    "unit": unit,
-                    "qty": 0.0 if unit != 'buc' else 0,
-                    "value_cents": 0
-                }
+                agg[pid] = {"name": r["name"], "barcode": r["barcode"], "unit": unit,
+                            "qty": 0.0 if unit != "buc" else 0, "value_cents": 0}
             agg[pid]["qty"] += qty_human
             agg[pid]["value_cents"] += value_cents
 
         items = list(agg.values())
-        # sortare desc după cantitate
         items.sort(key=lambda x: x["qty"], reverse=True)
 
         total_distinct = len(items)
-        total_qty = sum(x["qty"] for x in items)
         total_value_cents = sum(x["value_cents"] for x in items)
 
-        # pregătește top10 pentru UI
         top10 = [{
-            "name": it["name"],
-            "barcode": it["barcode"],
-            "qty": it["qty"],
-            "unit": it["unit"],
-            "value_lei": cents_to_lei(it["value_cents"])
+            "name": it["name"], "barcode": it["barcode"], "qty": it["qty"],
+            "unit": it["unit"], "value_lei": cents_to_lei(it["value_cents"])
         } for it in items[:10]]
 
         return {
             "total_distinct": total_distinct,
-            "total_qty": total_qty,
+            # păstrăm 'total_qty' DOAR pentru compatibilitate, dar nu-l mai folosim în UI
+            "total_qty": float(total_buc) + total_kg + total_l,
+            "total_qty_buc": int(total_buc),
+            "total_qty_kg":  float(total_kg),
+            "total_qty_l":   float(total_l),
             "total_value_lei": cents_to_lei(total_value_cents),
-            "top10": top10
+            "top10": top10,
         }
+
 
     # ---------- LISTĂ STOC ----------
     def get_stock_list(self, search: str='') -> List[dict]:
