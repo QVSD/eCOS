@@ -1,5 +1,7 @@
 from PySide6 import QtWidgets, QtCore, QtGui
 from ..services.use_cases import InventoryService
+from datetime import date, datetime 
+import csv, os
 
 #TO DO cantitatea introdusa nu poate fi cu ,5 trebuie sa fie numar natural!
 # Posibilitatea de a modifica datele introduse dupa adaugare in fereastra. In caz ca am pus ceva gresit.
@@ -263,17 +265,40 @@ class IntrareDialog(QtWidgets.QDialog):
 
 
     def finish_session(self):
+        # scrie mișcările în stoc și închide sesiunea
         self.svc.close_stock_in_session(self.session_id)
         summary = self.svc.get_stock_in_summary(self.session_id)
-        qty_text = self._format_unit_totals(summary)
-        QtWidgets.QMessageBox.information(
-            self,
-            "Rezumat intrare",
+
+        # mesaj + butoane custom
+        msg = QtWidgets.QMessageBox(self)
+        msg.setIcon(QtWidgets.QMessageBox.Information)
+        msg.setWindowTitle("Rezumat intrare")
+
+        # dacă ai deja metoda care afișează pe unități (buc/kg/l), păstreaz-o aici.
+        buc = summary.get("total_qty_buc", 0)
+        kg  = summary.get("total_qty_kg", 0.0)
+        l   = summary.get("total_qty_l", 0.0)
+
+        text = (
             "Sesiune închisă.\n\n"
             f"Produse distincte: {summary['total_distinct']}\n"
-            f"Cantități: {qty_text}\n"
+            f"Total bucăți: {buc}\n"
+            f"Total kg: {kg:.3f}\n"
+            f"Total litri: {l:.3f}\n"
             f"Valoare (cost): {summary['total_value_lei']:.2f} lei\n"
         )
+        msg.setText(text)
+
+        msg.setText(text)
+
+        btn_export = msg.addButton("Exportă…", QtWidgets.QMessageBox.ActionRole)
+        btn_ok = msg.addButton("OK", QtWidgets.QMessageBox.AcceptRole)
+
+        msg.exec()
+
+        if msg.clickedButton() is btn_export:
+            self._export_session_to_file()
+
         self.accept()
 
 
@@ -385,6 +410,137 @@ class IntrareDialog(QtWidgets.QDialog):
             self.refresh_lines()
             self.refresh_summary()
 
+    # export csv fereastra finalizare
+    def _export_session_to_file(self):
+
+        suggested = f"intrare-S{self.session_id}-{date.today().isoformat()}.csv"
+        path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Exportă sesiunea",
+            suggested,
+            "CSV (*.csv);;Excel (*.xlsx)"
+        )
+        if not path:
+            return
+
+        rows = self.svc.get_stock_in_lines(self.session_id)
+
+        headers = [
+            "Nr", "Denumire", "Cod", "Unitate", "Cantitate",
+            "Lot", "Expiră la", "Cost/unit", "Preț la raft", "Valoare",
+            "Furnizor", "Doc furnizor"
+        ]
+
+        # --- XLSX (cu formate) ---
+        if path.lower().endswith(".xlsx"):
+            try:
+                from openpyxl import Workbook
+                from openpyxl.utils import get_column_letter
+                from openpyxl.styles import numbers
+
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Intrare"
+
+                ws.append(headers)
+
+                for i, it in enumerate(rows, start=1):
+                    qty = int(it["qty_human"]) if it["unit"] == "buc" else float(it["qty_human"])
+
+                    # rândul brut
+                    row_vals = [
+                        i,
+                        it.get("name") or "",
+                        it.get("barcode") or "",
+                        it.get("unit") or "",
+                        qty,
+                        it.get("lot_code") or "",
+                        it.get("expiry_date") or "",
+                        float(f'{it.get("unit_cost_lei", 0.0):.2f}'),
+                        float(f'{it.get("price_per_unit_lei", 0.0):.2f}'),
+                        float(f'{it.get("line_value_lei", 0.0):.2f}'),
+                        it.get("supplier_name") or "",
+                        it.get("supplier_doc") or "",
+                    ]
+                    ws.append(row_vals)
+
+                    r = ws.max_row
+                    # Cod de bare ca TEXT (nu științific)
+                    c_barcode = ws.cell(row=r, column=3)
+                    c_barcode.number_format = numbers.FORMAT_TEXT
+
+                    # Cantitate: format general (sau 0 pentru buc / 0.000 altfel)
+                    c_qty = ws.cell(row=r, column=5)
+                    c_qty.number_format = "0" if (it.get("unit") == "buc") else "0.000"
+
+                    # Prețuri/Valori: 2 zecimale
+                    for col in (8, 9, 10):  # cost/unit, pret la raft, valoare
+                        ws.cell(row=r, column=col).number_format = "0.00"
+
+                # auto-size simplu
+                for col in range(1, len(headers) + 1):
+                    ws.column_dimensions[get_column_letter(col)].width = 15
+
+                wb.save(path)
+                QtWidgets.QMessageBox.information(self, "Export", f"Exportat ca XLSX:\n{path}")
+                return
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Export XLSX",
+                    f"Nu s-a putut exporta ca .xlsx ({e}). Salvez CSV în schimb."
+                )
+                root, _ = os.path.splitext(path)
+                path = root + ".csv"  # fallback pe CSV
+
+        # --- CSV (prietenos cu Excel RO) ---
+        try:
+            # UTF-8 cu BOM ca Excel să detecteze corect
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                # separator ; pentru a nu intra în conflict cu zecimalele cu virgulă
+                w = csv.writer(f, delimiter=';')
+                w.writerow(headers)
+
+                for i, it in enumerate(rows, start=1):
+                    qty = int(it["qty_human"]) if it["unit"] == "buc" else float(it["qty_human"])
+
+                    # Codul de bare ca text (blochează E+)
+                    barcode = it.get("barcode") or ""
+                    if barcode:
+                        barcode = f'="{barcode}"'   # Excel îl păstrează exact
+
+                    # conversie zecimale cu virgulă pentru Excel RO
+                    def z(val, prec=2):
+                        return f"{float(val):.{prec}f}".replace(".", ",")
+
+                    cost = z(it.get("unit_cost_lei", 0.0))
+                    price = z(it.get("price_per_unit_lei", 0.0))
+                    value = z(it.get("line_value_lei", 0.0))
+
+                    # cantitate cu format în funcție de unitate
+                    if it.get("unit") == "buc":
+                        qty_out = str(int(qty))
+                    else:
+                        qty_out = f"{qty:.3f}".replace(".", ",")
+
+                    w.writerow([
+                        i,
+                        it.get("name") or "",
+                        barcode,
+                        it.get("unit") or "",
+                        qty_out,
+                        it.get("lot_code") or "",
+                        it.get("expiry_date") or "",
+                        cost,
+                        price,
+                        value,
+                        it.get("supplier_name") or "",
+                        it.get("supplier_doc") or "",
+                    ])
+            QtWidgets.QMessageBox.information(self, "Export", f"Exportat ca CSV:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export", f"Eroare la scrierea fișierului:\n{e}")
+
+
 ### -----------------------------------------------------------------------------------------------------------------------------------
 ###     
 ###                                                     EDIT STOCK 
@@ -440,7 +596,7 @@ class EditStockInLineDialog(QtWidgets.QDialog):
         self.sp_price.setDecimals(2)
         self.sp_price.setMaximum(1e9)
         self.sp_price.setValue(float(line.get("price_per_unit_lei", 0.0)))
-        form.addRow("Preț la raft / unitate", self.sp_price)
+        form.addRow("Pret la raft / unitate", self.sp_price)
 
         self.ed_sup  = QtWidgets.QLineEdit(line.get("supplier_name") or "")
         self.ed_doc  = QtWidgets.QLineEdit(line.get("supplier_doc") or "")
