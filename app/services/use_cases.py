@@ -19,6 +19,14 @@ def to_base_qty(unit: str, qty: float) -> int:
     else:
         raise ValueError(f"Unitate necunoscută: {unit}")
 
+def _date_text(v):
+    if v is None:
+        return None
+    if isinstance(v, (date, datetime)):
+        return v.date().isoformat() if isinstance(v, datetime) else v.isoformat()
+    # e deja string
+    return str(v)
+
 class InventoryService:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -53,15 +61,29 @@ class InventoryService:
             return None
         conn = connect(self.db_path)
         with conn:
+            if lot_code:
+                row = conn.execute(
+                    "SELECT id, expiry_date FROM batches WHERE product_id=? AND lot_code=?",
+                    (product_id, lot_code)
+                ).fetchone()
+                if row:
+                    old_txt = _date_text(row["expiry_date"])
+                    new_txt = _date_text(expiry_date)
+                    # Dacă vine o dată diferită -> actualizează lotul
+                    if new_txt and old_txt != new_txt:
+                        conn.execute("UPDATE batches SET expiry_date=? WHERE id=?", (new_txt, row["id"]))
+                    return row["id"]
+
             row = conn.execute(
                 "SELECT id FROM batches WHERE product_id=? AND IFNULL(expiry_date,'')=IFNULL(?, '') AND IFNULL(lot_code,'')=IFNULL(?, '')",
-                (product_id, expiry_date, lot_code)
+                (product_id, _date_text(expiry_date) or None, lot_code or None)
             ).fetchone()
             if row:
                 return row["id"]
+
             cur = conn.execute(
                 "INSERT INTO batches(product_id, expiry_date, lot_code) VALUES(?,?,?)",
-                (product_id, expiry_date, lot_code)
+                (product_id, _date_text(expiry_date) or None, lot_code or None)
             )
             return cur.lastrowid
 
@@ -96,8 +118,12 @@ class InventoryService:
             product_id = p["id"]
             prod_unit = p.get("unit", unit)
 
-            # lot (opțional)
+            # lot (opțional) – dacă nu s-a introdus, îl generăm automat
+            if not lot_code:
+                lot_code = self._auto_lot_code(session_id)
+
             batch_id = self.get_or_create_batch(product_id, expiry_date, lot_code)
+
 
             # cantitatea în unități de bază
             qty_base = to_base_qty(prod_unit, quantity)
@@ -585,3 +611,152 @@ class InventoryService:
 
         items.sort(key=lambda x: (x["days_left"], x["expiry_date"]))
         return items
+    
+    def update_product_price(self, product_id: int, price_per_unit_lei: float) -> None:
+        conn = connect(self.db_path)
+        with conn:
+            conn.execute(
+                "UPDATE products SET price_per_unit_cents=? WHERE id=?",
+                (lei_to_cents(price_per_unit_lei), int(product_id))
+            )
+
+    
+    def _next_seq(self, name: str) -> int:
+        ### Contor atomic pe cheie (ex: 'lot:session:15:20250919').
+        conn = connect(self.db_path)
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sequences (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
+            """)
+            conn.execute("INSERT OR IGNORE INTO sequences(name, value) VALUES(?, 0)", (name,))
+            conn.execute("UPDATE sequences SET value = value + 1 WHERE name=?", (name,))
+            row = conn.execute("SELECT value FROM sequences WHERE name=?", (name,)).fetchone()
+            return int(row["value"])
+
+    def _auto_lot_code(self, session_id: int) -> str:
+        """Generează un cod de lot lizibil și unic. Format: S<sess>-<zi>-<nr> (ex. S12-20250919-0001)."""
+        ymd = date.today().strftime("%Y%m%d")
+        seq = self._next_seq(f"lot:session:{session_id}:{ymd}")   # contor pe sesiune + zi
+        return f"S{session_id}-{ymd}-{seq:04d}"
+    
+    # --- Liniile dintr-o sesiune de intrare (pt. UI) ---
+    def get_stock_in_lines(self, session_id: int) -> list[dict]:
+        """
+        Returnează liniile exacte din sesiune:
+        line_id, product_id, name, barcode, unit, qty_human, expiry_date, lot_code,
+        unit_cost_lei, line_value_lei
+        """
+        conn = connect(self.db_path)
+        rows = conn.execute("""
+            SELECT l.id AS line_id, l.product_id, l.quantity_base, l.unit_cost_cents,
+                l.supplier_name, l.supplier_doc,
+                p.name, p.barcode, p.unit, p.price_per_unit_cents,
+                b.expiry_date, b.lot_code
+            FROM stock_in_lines l
+            JOIN products p ON p.id = l.product_id
+            LEFT JOIN batches b ON b.id = l.batch_id
+            WHERE l.session_id=?
+            ORDER BY l.id
+        """, (session_id,)).fetchall()
+
+        items = []
+        for r in rows:
+            unit = r["unit"]
+            qty_base = int(r["quantity_base"])
+            qty_human = float(qty_base) if unit == "buc" else qty_base / 1000.0
+            cost_cents = r["unit_cost_cents"]
+            # valoarea liniei, conform convenției (cost per buc / kg / l)
+            if cost_cents is None:
+                line_val_lei = 0.0
+            else:
+                if unit == "buc":
+                    line_val_lei = (cost_cents * qty_human) / 100.0
+                else:
+                    line_val_lei = (cost_cents * (qty_base / 1000.0)) / 100.0
+
+            items.append({
+                "line_id": int(r["line_id"]),
+                "product_id": int(r["product_id"]),
+                "name": r["name"],
+                "barcode": r["barcode"],
+                "unit": unit,
+                "qty_human": qty_human,
+                "expiry_date": (
+                    r["expiry_date"].isoformat() if hasattr(r["expiry_date"], "isoformat")
+                    else (str(r["expiry_date"]) if r["expiry_date"] is not None else None)
+                ),
+                "lot_code": r["lot_code"],
+                "unit_cost_lei": 0.0 if cost_cents is None else cost_cents / 100.0,
+                "line_value_lei": line_val_lei,
+                "supplier_name": r["supplier_name"],
+                "supplier_doc": r["supplier_doc"],
+                "price_per_unit_lei": 0.0 if r["price_per_unit_cents"] is None else r["price_per_unit_cents"] / 100.0,
+            })
+        return items
+
+    def update_stock_in_line(
+        self,
+        line_id: int,
+        *,
+        qty_human: float | None = None,
+        expiry_date: str | None | object = ...,
+        lot_code: str | None | object = ...,
+        unit_cost_lei: float | None = None,
+        supplier_name: str | None | object = ...,
+        supplier_doc: str | None | object = ...,
+    ) -> None:
+        conn = connect(self.db_path)
+        row = conn.execute("""
+            SELECT l.product_id, l.quantity_base, l.unit_cost_cents, l.batch_id,
+                p.unit, l.supplier_name, l.supplier_doc
+            FROM stock_in_lines l
+            JOIN products p ON p.id = l.product_id
+            WHERE l.id=?
+        """, (line_id,)).fetchone()
+        if not row:
+            raise ValueError("Linia nu există.")
+
+        product_id = int(row["product_id"])
+        unit = row["unit"]
+
+        # cantitate -> base
+        new_qty_base = int(row["quantity_base"])
+        if qty_human is not None:
+            new_qty_base = int(round(qty_human)) if unit == "buc" else int(round(float(qty_human) * 1000))
+
+        # cost
+        new_cost_cents = row["unit_cost_cents"]
+        if unit_cost_lei is not None:
+            new_cost_cents = lei_to_cents(unit_cost_lei)
+
+        # batch (schimbă doar dacă a cerut UI)
+        new_batch_id = row["batch_id"]
+        if (expiry_date is not ...) or (lot_code is not ...):
+            exp = None if expiry_date is ... else expiry_date
+            lot = None if lot_code is ... else (lot_code or None)
+            new_batch_id = self.get_or_create_batch(product_id, exp, lot)
+
+        # supplier fields (păstrează-vechile dacă nu-s transmise)
+        new_supplier_name = row["supplier_name"] if supplier_name is ... else supplier_name
+        new_supplier_doc  = row["supplier_doc"]  if supplier_doc  is ... else supplier_doc
+
+        with conn:
+            conn.execute("""
+                UPDATE stock_in_lines
+                SET quantity_base=?,
+                    unit_cost_cents=?,
+                    batch_id=?,
+                    supplier_name=?,
+                    supplier_doc=?
+                WHERE id=?
+            """, (new_qty_base, new_cost_cents, new_batch_id, new_supplier_name, new_supplier_doc, line_id))
+
+    def delete_stock_in_line(self, line_id: int) -> None:
+        conn = connect(self.db_path)
+        with conn:
+            conn.execute("DELETE FROM stock_in_lines WHERE id=?", (line_id,))
+
+
